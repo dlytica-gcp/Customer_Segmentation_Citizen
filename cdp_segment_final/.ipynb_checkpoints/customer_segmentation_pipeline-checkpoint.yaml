@@ -1,0 +1,336 @@
+# PIPELINE DEFINITION
+# Name: customer-segmentation-pipeline
+# Inputs:
+#    minio_bucket: str [Default: 'ai360ctzn-customer-segmentation']
+components:
+  comp-feature-engineering-and-segmentation:
+    executorLabel: exec-feature-engineering-and-segmentation
+    inputDefinitions:
+      parameters:
+        file_path:
+          parameterType: STRING
+        minio_bucket:
+          parameterType: STRING
+    outputDefinitions:
+      parameters:
+        model_path:
+          parameterType: STRING
+        segmentation_path:
+          parameterType: STRING
+  comp-fetch-data-trino:
+    executorLabel: exec-fetch-data-trino
+    inputDefinitions:
+      parameters:
+        minio_bucket:
+          parameterType: STRING
+    outputDefinitions:
+      parameters:
+        Output:
+          parameterType: STRING
+  comp-save-predictions-to-trino:
+    executorLabel: exec-save-predictions-to-trino
+    inputDefinitions:
+      parameters:
+        minio_bucket:
+          parameterType: STRING
+        segmentation_path:
+          parameterType: STRING
+    outputDefinitions:
+      parameters:
+        Output:
+          parameterType: STRING
+deploymentSpec:
+  executors:
+    exec-feature-engineering-and-segmentation:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - feature_engineering_and_segmentation
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.1'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'pyspark' 'pandas'\
+          \ 'boto3' 'scikit-learn' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef feature_engineering_and_segmentation(\n    file_path: str, \n\
+          \    minio_bucket: str\n) -> NamedTuple('Outputs', [('segmentation_path',\
+          \ str), ('model_path', str)]):\n    from pyspark.sql import SparkSession\n\
+          \    from pyspark.ml.feature import VectorAssembler, StandardScaler\n  \
+          \  from pyspark.ml.clustering import KMeans\n    from pyspark.ml import\
+          \ Pipeline\n    import boto3\n    import os\n    from datetime import datetime\n\
+          \    from collections import namedtuple\n\n    # Initialize Spark with optimized\
+          \ settings\n    spark = SparkSession.builder \\\n        .appName(\"CustomerSegmentation\"\
+          ) \\\n        .config(\"spark.driver.memory\", \"8g\") \\\n        .config(\"\
+          spark.executor.memory\", \"8g\") \\\n        .config(\"spark.sql.shuffle.partitions\"\
+          , \"200\") \\\n        .getOrCreate()\n\n    # Initialize MinIO client\n\
+          \    minio_client = boto3.client(\n        's3',\n        endpoint_url=\"\
+          http://192.168.80.155:32000\",\n        aws_access_key_id=\"admin\",\n \
+          \       aws_secret_access_key=\"dlyticaD123\",\n        verify=False\n \
+          \   )\n\n    try:\n        # Download data from MinIO\n        local_path\
+          \ = \"/tmp/raw_data.csv\"\n        minio_client.download_file(minio_bucket,\
+          \ file_path, local_path)\n\n        # Load data\n        df = spark.read.csv(local_path,\
+          \ header=True, inferSchema=True)\n\n        # Select numeric features\n\
+          \        numeric_cols = [col for col in df.columns if col not in ['custid']]\n\
+          \n        # Feature pipeline\n        assembler = VectorAssembler(inputCols=numeric_cols,\
+          \ outputCol=\"features\")\n        scaler = StandardScaler(inputCol=\"features\"\
+          , outputCol=\"scaled_features\")\n        kmeans = KMeans(k=5, seed=42,\
+          \ featuresCol=\"scaled_features\")\n\n        pipeline = Pipeline(stages=[assembler,\
+          \ scaler, kmeans])\n        model = pipeline.fit(df)\n\n        # Make predictions\n\
+          \        predictions = model.transform(df)\n\n        # Save results\n \
+          \       today = datetime.now().strftime('%Y-%m-%d')\n        results_path\
+          \ = f\"/tmp/segmentation_results_{today}.csv\"\n        predictions.select(\"\
+          custid\", \"prediction\").toPandas().to_csv(results_path, index=False)\n\
+          \n        # Save model\n        model_path = f\"/tmp/segmentation_model_{today}\"\
+          \n        model.write().overwrite().save(model_path)\n\n        # Upload\
+          \ to MinIO\n        minio_results_path = f\"results/segmentation_{today}.csv\"\
+          \n        minio_client.upload_file(results_path, minio_bucket, minio_results_path)\n\
+          \n        minio_model_path = f\"models/segmentation_model_{today}\"\n  \
+          \      for root, _, files in os.walk(model_path):\n            for file\
+          \ in files:\n                file_path = os.path.join(root, file)\n    \
+          \            relative_path = os.path.relpath(file_path, model_path)\n  \
+          \              minio_client.upload_file(\n                    file_path,\
+          \ \n                    minio_bucket, \n                    f\"{minio_model_path}/{relative_path}\"\
+          \n                )\n\n        output = namedtuple('Outputs', ['segmentation_path',\
+          \ 'model_path'])\n        return output(minio_results_path, minio_model_path)\n\
+          \n    except Exception as e:\n        print(f\"Error in feature_engineering_and_segmentation:\
+          \ {str(e)}\")\n        raise\n    finally:\n        spark.stop()\n\n"
+        image: quay.io/datanature_dev/jupyternotebook:java_home14
+    exec-fetch-data-trino:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - fetch_data_trino
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.1'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'trino' 'pandas'\
+          \ 'pyarrow' 's3fs' 'boto3' 'urllib3' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef fetch_data_trino(minio_bucket: str) -> str:\n    import trino\n\
+          \    from trino.auth import BasicAuthentication\n    import csv\n    import\
+          \ boto3\n    import os\n    import urllib3\n    from datetime import datetime\n\
+          \n    # Disable SSL warnings\n    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\
+          \n    # Trino Connection Details\n    TRINO_HOST = \"192.168.80.155\"\n\
+          \    TRINO_PORT = \"30071\"\n    TRINO_USER = \"ctzn.bank\"\n    TRINO_PASSWORD\
+          \ = \"ctzn.bank_123\"\n    TRINO_CATALOG = \"iceberg\"\n    TRINO_SCHEMA\
+          \ = \"silver_crmuser\"\n    TRINO_HTTP_SCHEME = \"https\"\n\n    # Output\
+          \ file\n    OUTPUT_FILE = \"/tmp/ctzn_10_years_data.csv\"\n\n    # SQL Query\n\
+          \    SQL_QUERY = \"\"\"\n    WITH recent_customers AS (\n        SELECT\
+          \ DISTINCT g.cif_id\n        FROM gold.dim_gam AS g\n        WHERE CAST(DATE_PARSE(SUBSTRING(g.acct_opn_date,\
+          \ 1, 19), '%Y-%m-%dT%H:%i:%s') AS DATE) >= CURRENT_DATE - INTERVAL '10'\
+          \ YEAR\n    ),\n    account_activity AS (\n        SELECT \n           \
+          \ a.cif_id,\n            SUM(COALESCE(a.total_credit_tran_vol, 0) - COALESCE(a.total_debit_tran_vol,\
+          \ 0)) AS balance,\n            COUNT(DISTINCT a.nepali_month)/6.0 AS balance_frequency,\n\
+          \            SUM(COALESCE(a.total_debit_tran_vol, 0)) AS purchases,\n  \
+          \          MAX(COALESCE(a.total_debit_tran_vol, 0)) AS oneoff_purchases,\n\
+          \            SUM(COALESCE(a.total_debit_tran_vol, 0)) - MAX(COALESCE(a.total_debit_tran_vol,\
+          \ 0)) AS installments_purchases,\n            SUM(CASE WHEN COALESCE(a.total_credit_tran_vol,\
+          \ 0) > 0 AND COALESCE(a.total_debit_tran_vol, 0) = 0 \n                \
+          \    THEN COALESCE(a.total_credit_tran_vol, 0) ELSE 0 END) AS cash_advance,\n\
+          \            COUNT(DISTINCT a.foracid)/6.0 AS purchases_frequency,\n   \
+          \         COUNT(DISTINCT CASE WHEN COALESCE(a.total_debit_tran_vol, 0) >\
+          \ 100000 THEN a.foracid END)/6.0 AS oneoff_purchases_frequency,\n      \
+          \      COUNT(DISTINCT CASE WHEN COALESCE(a.total_debit_tran_vol, 0) BETWEEN\
+          \ 1 AND 100000 THEN a.foracid END)/6.0 AS purchases_installments_frequency,\n\
+          \            COUNT(DISTINCT CASE WHEN COALESCE(a.total_credit_tran_vol,\
+          \ 0) > 0 THEN a.foracid END)/6.0 AS cash_advance_frequency,\n          \
+          \  COUNT(DISTINCT CASE WHEN COALESCE(a.total_credit_tran_vol, 0) > 0 THEN\
+          \ a.foracid END) AS cash_advance_trx,\n            COUNT(DISTINCT a.foracid)\
+          \ AS purchases_trx,\n            SUM(COALESCE(a.total_credit_tran_vol, 0))\
+          \ AS payments,\n            COUNT(DISTINCT CASE WHEN COALESCE(a.total_credit_tran_vol,\
+          \ 0) >= COALESCE(a.total_debit_tran_vol, 0) \n                         \
+          \       THEN a.nepali_month END)/6.0 AS prc_full_payment\n        FROM gold.mv_fact_deposit_account_insights\
+          \ a\n        JOIN recent_customers rc ON a.cif_id = rc.cif_id\n        GROUP\
+          \ BY a.cif_id\n    ),\n    salary_stats AS (\n        SELECT \n        \
+          \    APPROX_PERCENTILE(COALESCE(salary_per_month, 0), 0.5) AS median_salary,\n\
+          \            APPROX_PERCENTILE(COALESCE(salary_per_month, 0), 0.05) AS fifth_percentile_salary\n\
+          \        FROM gold.dim_customers\n    ),\n    customer_profile AS (\n  \
+          \      SELECT \n            g.cif_id,\n            DATE_DIFF('year', \n\
+          \                     CAST(DATE_PARSE(SUBSTRING(MIN(g.acct_opn_date), 1,\
+          \ 19), '%Y-%m-%dT%H:%i:%s') AS DATE), \n                     CURRENT_DATE)\
+          \ AS tenure,\n            (SELECT fifth_percentile_salary FROM salary_stats)\
+          \ AS minimum_payments\n        FROM gold.dim_gam g\n        LEFT JOIN gold.dim_customers\
+          \ c ON g.cif_id = c.cif_id\n        GROUP BY g.cif_id\n    )\n    SELECT\
+          \ \n        aa.cif_id AS custid,\n        aa.balance,\n        aa.balance_frequency,\n\
+          \        aa.purchases,\n        aa.oneoff_purchases,\n        aa.installments_purchases,\n\
+          \        aa.cash_advance,\n        aa.purchases_frequency,\n        aa.oneoff_purchases_frequency,\n\
+          \        aa.purchases_installments_frequency,\n        aa.cash_advance_frequency,\n\
+          \        aa.cash_advance_trx,\n        aa.purchases_trx,\n        (SELECT\
+          \ median_salary * 3 FROM salary_stats) AS credit_limit,\n        aa.payments,\n\
+          \        cp.minimum_payments,\n        aa.prc_full_payment,\n        cp.tenure\n\
+          \    FROM account_activity aa\n    JOIN customer_profile cp ON aa.cif_id\
+          \ = cp.cif_id\n    ORDER BY aa.cif_id\n    \"\"\"\n\n    try:\n        #\
+          \ Connect to Trino\n        conn = trino.dbapi.connect(\n            host=TRINO_HOST,\n\
+          \            port=TRINO_PORT,\n            user=TRINO_USER,\n          \
+          \  auth=BasicAuthentication(TRINO_USER, TRINO_PASSWORD),\n            catalog=TRINO_CATALOG,\n\
+          \            schema=TRINO_SCHEMA,\n            http_scheme=TRINO_HTTP_SCHEME,\n\
+          \            request_timeout=600,\n            verify=False\n        )\n\
+          \        cursor = conn.cursor()\n\n        # Execute query and fetch data\n\
+          \        cursor.execute(SQL_QUERY)\n        columns = [desc[0] for desc\
+          \ in cursor.description]\n\n        # Write to CSV in batches\n        with\
+          \ open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as f:\n         \
+          \   writer = csv.writer(f)\n            writer.writerow(columns)\n\n   \
+          \         while True:\n                rows = cursor.fetchmany(1000)\n \
+          \               if not rows:\n                    break\n              \
+          \  writer.writerows(rows)\n\n        # Upload to MinIO\n        minio_client\
+          \ = boto3.client(\n            's3',\n            endpoint_url=\"http://192.168.80.155:32000\"\
+          ,\n            aws_access_key_id=\"admin\",\n            aws_secret_access_key=\"\
+          dlyticaD123\",\n            verify=False\n        )\n\n        current_date\
+          \ = datetime.now().strftime(\"%Y-%m-%d\")\n        minio_path = f\"data/customer_segmentation_raw_{current_date}.csv\"\
+          \n        minio_client.upload_file(OUTPUT_FILE, minio_bucket, minio_path)\n\
+          \n        return minio_path\n\n    except Exception as e:\n        print(f\"\
+          Error in fetch_data_trino: {str(e)}\")\n        raise\n    finally:\n  \
+          \      if 'cursor' in locals():\n            cursor.close()\n        if\
+          \ 'conn' in locals():\n            conn.close()\n\n"
+        image: bitnami/spark:3.5
+    exec-save-predictions-to-trino:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - save_predictions_to_trino
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.12.1'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'trino' 'pandas'\
+          \ 'boto3' 'urllib3' && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef save_predictions_to_trino(\n    segmentation_path: str,\n   \
+          \ minio_bucket: str\n) -> str:\n    import trino\n    from trino.auth import\
+          \ BasicAuthentication\n    import pandas as pd\n    import boto3\n    import\
+          \ urllib3\n\n    # Disable SSL warnings\n    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\
+          \n    try:\n        # Download predictions from MinIO\n        minio_client\
+          \ = boto3.client(\n            's3',\n            endpoint_url=\"http://192.168.80.155:32000\"\
+          ,\n            aws_access_key_id=\"admin\",\n            aws_secret_access_key=\"\
+          dlyticaD123\",\n            verify=False\n        )\n\n        local_path\
+          \ = \"/tmp/predictions.csv\"\n        minio_client.download_file(minio_bucket,\
+          \ segmentation_path, local_path)\n        predictions = pd.read_csv(local_path)\n\
+          \n        # Connect to Trino\n        conn = trino.dbapi.connect(\n    \
+          \        host=\"192.168.80.155\",\n            port=30071,\n           \
+          \ user=\"ctzn.bank\",\n            auth=BasicAuthentication(\"ctzn.bank\"\
+          , \"ctzn.bank_123\"),\n            catalog=\"iceberg\",\n            schema=\"\
+          silver_crmuser\",\n            http_scheme=\"https\",\n            verify=False\n\
+          \        )\n        cursor = conn.cursor()\n\n        # Create table if\
+          \ not exists\n        cursor.execute(\"\"\"\n        CREATE TABLE IF NOT\
+          \ EXISTS iceberg.silver_crmuser.customer_segments (\n            cif_id\
+          \ VARCHAR,\n            cluster_id INTEGER,\n            processed_date\
+          \ TIMESTAMP\n        ) WITH (\n            partitioning = ARRAY['processed_date']\n\
+          \        )\n        \"\"\")\n\n        # Insert predictions in batches\n\
+          \        batch_size = 1000\n        for i in range(0, len(predictions),\
+          \ batch_size):\n            batch = predictions[i:i+batch_size]\n      \
+          \      values = [(str(row['custid']), int(row['prediction'])) for _, row\
+          \ in batch.iterrows()]\n\n            insert_sql = \"\"\"\n            INSERT\
+          \ INTO iceberg.silver_crmuser.customer_segments \n            (cif_id, cluster_id,\
+          \ processed_date) \n            VALUES (?, ?, CURRENT_TIMESTAMP)\n     \
+          \       \"\"\"\n\n            cursor.executemany(insert_sql, values)\n \
+          \           conn.commit()\n\n        return f\"Successfully saved {len(predictions)}\
+          \ predictions to Trino\"\n\n    except Exception as e:\n        print(f\"\
+          Error in save_predictions_to_trino: {str(e)}\")\n        raise\n    finally:\n\
+          \        if 'cursor' in locals():\n            cursor.close()\n        if\
+          \ 'conn' in locals():\n            conn.close()\n\n"
+        image: bitnami/spark:3.5
+pipelineInfo:
+  name: customer-segmentation-pipeline
+root:
+  dag:
+    tasks:
+      feature-engineering-and-segmentation:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-feature-engineering-and-segmentation
+        dependentTasks:
+        - fetch-data-trino
+        inputs:
+          parameters:
+            file_path:
+              taskOutputParameter:
+                outputParameterKey: Output
+                producerTask: fetch-data-trino
+            minio_bucket:
+              componentInputParameter: minio_bucket
+        taskInfo:
+          name: feature-engineering-and-segmentation
+      fetch-data-trino:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-fetch-data-trino
+        inputs:
+          parameters:
+            minio_bucket:
+              componentInputParameter: minio_bucket
+        taskInfo:
+          name: fetch-data-trino
+      save-predictions-to-trino:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-save-predictions-to-trino
+        dependentTasks:
+        - feature-engineering-and-segmentation
+        inputs:
+          parameters:
+            minio_bucket:
+              componentInputParameter: minio_bucket
+            segmentation_path:
+              taskOutputParameter:
+                outputParameterKey: segmentation_path
+                producerTask: feature-engineering-and-segmentation
+        taskInfo:
+          name: save-predictions-to-trino
+  inputDefinitions:
+    parameters:
+      minio_bucket:
+        defaultValue: ai360ctzn-customer-segmentation
+        isOptional: true
+        parameterType: STRING
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.12.1
